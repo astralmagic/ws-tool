@@ -269,6 +269,15 @@ fn connectionThreadMain(args: ConnectionThreadArgs) void {
     switch (request.upgradeRequested()) {
         .websocket => |opt_key| {
             const key = opt_key orelse return;
+            if (!isAllowedOrigin(&request)) {
+                request.respond("Forbidden origin\n", .{
+                    .status = .forbidden,
+                    .extra_headers = &.{
+                        .{ .name = "Content-Type", .value = "text/plain; charset=utf-8" },
+                    },
+                }) catch {};
+                return;
+            }
             var ws = request.respondWebSocket(.{ .key = key }) catch return;
             ws.flush() catch return;
             serveWebSocket(args.config, &ws, args.connection, &request) catch {};
@@ -476,7 +485,54 @@ fn getHeader(request: *http.Server.Request, name: []const u8) ?[]const u8 {
     return null;
 }
 
+fn extractHostOnly(raw: []const u8) []const u8 {
+    var s = std.mem.trim(u8, raw, " \t");
+    if (s.len == 0) return "";
+    if (s[0] == '[') {
+        if (std.mem.indexOfScalar(u8, s, ']')) |idx| {
+            return s[1..idx];
+        }
+        return "";
+    }
+    if (std.mem.lastIndexOfScalar(u8, s, ':')) |idx| {
+        if (std.mem.indexOfScalar(u8, s, ':') == idx) {
+            return s[0..idx];
+        }
+    }
+    return s;
+}
+
+fn isAllowedOrigin(request: *http.Server.Request) bool {
+    const origin = getHeader(request, "Origin") orelse return true;
+    const trimmed_origin = std.mem.trim(u8, origin, " \t");
+    if (trimmed_origin.len == 0 or std.ascii.eqlIgnoreCase(trimmed_origin, "null")) return false;
+    var rest = trimmed_origin;
+    if (std.ascii.startsWithIgnoreCase(rest, "http://")) {
+        rest = rest[7..];
+    } else if (std.ascii.startsWithIgnoreCase(rest, "https://")) {
+        rest = rest[8..];
+    } else {
+        return false;
+    }
+    if (std.mem.indexOfScalar(u8, rest, '/')) |slash_idx| {
+        rest = rest[0..slash_idx];
+    }
+    const origin_host = extractHostOnly(rest);
+    if (origin_host.len == 0) return false;
+
+    const host_hdr = getHeader(request, "Host") orelse return false;
+    const req_host = extractHostOnly(host_hdr);
+    if (req_host.len == 0) return false;
+    return std.ascii.eqlIgnoreCase(origin_host, req_host);
+}
+
 fn putHeaderEnv(arena: Allocator, env_map: *process.EnvMap, name: []const u8, value: []const u8) !void {
+    if (name.len == 0 or std.ascii.eqlIgnoreCase(name, "Proxy")) return;
+    for (name) |c| {
+        const ok = (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '-';
+        if (!ok) return;
+    }
+    const clamped_value = if (value.len > max_header_value_len) value[0..max_header_value_len] else value;
     var key_buf = try arena.alloc(u8, 5 + name.len);
     @memcpy(key_buf[0..5], "HTTP_");
     for (name, 0..) |c, idx| {
@@ -486,7 +542,7 @@ fn putHeaderEnv(arena: Allocator, env_map: *process.EnvMap, name: []const u8, va
             else => c,
         };
     }
-    try env_map.put(key_buf, value);
+    try env_map.put(key_buf, clamped_value);
 }
 
 fn deriveServerName(arena: Allocator, raw: []const u8) ![]const u8 {
